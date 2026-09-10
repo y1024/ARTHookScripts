@@ -35,6 +35,22 @@ let v = parseFridaVersion(Frida.version)
 if (!v || v.major >= 17) {
     Module.findExportByName = function(moduleName: string | null, exportName: string): NativePointer | null {
         // console.log(`[Frida Adapter] Redirecting Module.findExportByName('${moduleName}', '${exportName}') to Module.findGlobalExportByName('${exportName}')`);
-        return Module.findGlobalExportByName(exportName);
+        if (moduleName === null) {
+            return Module.findGlobalExportByName(exportName);
+        }
+        const module = Process.findModuleByName(moduleName);
+        return module === null ? null : module.findExportByName(exportName);
+    }
+}
+
+// Frida 17+ removed the throwing static Module.getExportByName(), but the agent still uses it.
+// Re-implement it on top of Module.findExportByName() so the code keeps working on every Frida version.
+if (typeof (Module as any).getExportByName !== 'function') {
+    (Module as any).getExportByName = function(moduleName: string | null, exportName: string): NativePointer {
+        const address = Module.findExportByName(moduleName, exportName);
+        if (address === null) {
+            throw new Error(`Unable to find export '${exportName}' in module '${moduleName}'`);
+        }
+        return address;
     }
 }

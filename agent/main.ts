@@ -8,6 +8,8 @@ globalThis.testArtMethod = () => {
     // Java.perform(()=>{
     //     console.log(Java.openClassFile("/data/local/tmp/dex_androidx.dex"))
     // })
+
+    pathToArtMethod("com.moutai.mtsc.RandK.mixK").show()
     
     Java.perform(() => {
 

@@ -87,18 +87,39 @@ export function getSym(symName: string, md: string = "libart.so", checkNotFuncti
 Reflect.set(globalThis, "getSym", getSym)
 Reflect.set(globalThis, "callSym", callSym)
 
+// Cached NativeFunctions: formatSymbol() demangles once per distinct address, so
+// rebuilding these on every call would dominate the cost of a full disassembly.
+let cxaDemangle: NativeFunction | null = null
+let cxaDemangleFree: NativeFunction | null = null
+let cxaDemangleFreeResolved: boolean = false
+
+function getCxaDemangle(): NativeFunction {
+    if (cxaDemangle !== null) return cxaDemangle
+    let demangleAddress: NativePointer | null = Module.findExportByName("libc++.so", '__cxa_demangle')
+    if (demangleAddress == null) demangleAddress = Module.findExportByName("libunwindstack.so", '__cxa_demangle')
+    if (demangleAddress == null) demangleAddress = Module.findExportByName("libbacktrace.so", '__cxa_demangle')
+    if (demangleAddress == null) demangleAddress = Module.findExportByName(null, '__cxa_demangle')
+    if (demangleAddress == null) throw Error("can not find export function -> __cxa_demangle")
+    cxaDemangle = new NativeFunction(demangleAddress, 'pointer', ['pointer', 'pointer', 'pointer', 'pointer'])
+    return cxaDemangle
+}
+
+function getCxaDemangleFree(): NativeFunction | null {
+    if (!cxaDemangleFreeResolved) {
+        cxaDemangleFreeResolved = true
+        const freeAddr: NativePointer | null = Module.findExportByName("libc.so", 'free')
+        cxaDemangleFree = freeAddr === null ? null : new NativeFunction(freeAddr, 'void', ['pointer'])
+    }
+    return cxaDemangleFree
+}
+
 /**
  * Demangles a C++ symbol name using available libraries.
  * @param expName The mangled symbol name to demangle.
  * @returns The demangled symbol name, or an empty string if demangling failed.
  */
 export function demangleName(expName: string) {
-    let demangleAddress: NativePointer | null = Module.findExportByName("libc++.so", '__cxa_demangle')
-    if (demangleAddress == null) demangleAddress = Module.findExportByName("libunwindstack.so", '__cxa_demangle')
-    if (demangleAddress == null) demangleAddress = Module.findExportByName("libbacktrace.so", '__cxa_demangle')
-    if (demangleAddress == null) demangleAddress = Module.findExportByName(null, '__cxa_demangle')
-    if (demangleAddress == null) throw Error("can not find export function -> __cxa_demangle")
-    let demangle: Function = new NativeFunction(demangleAddress, 'pointer', ['pointer', 'pointer', 'pointer', 'pointer'])
+    const demangle: NativeFunction = getCxaDemangle()
     let mangledName: NativePointer = Memory.allocUtf8String(expName)
     let outputBuffer: NativePointer = NULL
     let length: NativePointer = NULL
@@ -106,8 +127,83 @@ export function demangleName(expName: string) {
     let result: NativePointer = demangle(mangledName, outputBuffer, length, status) as NativePointer
     if (status.readInt() === 0) {
         let resultStr: string | null = result.readUtf8String()
+        // __cxa_demangle malloc()s the returned buffer when *output_buffer is NULL.
+        if (!result.isNull() && !result.equals(mangledName)) {
+            const free: NativeFunction | null = getCxaDemangleFree()
+            if (free !== null) free(result)
+        }
         return (resultStr == null || resultStr == expName) ? "" : resultStr
     } else return ""
 }
 
 globalThis.demangleName = demangleName
+
+const DebugSymbolCache: Map<string, string> = new Map()
+
+/**
+ * Render an address as `module!symbol`, resolved through DebugSymbol.
+ *
+ * - C++ names are demangled through __cxa_demangle
+ * - an address inside a symbol becomes `module!symbol+0xNN`
+ * - an unnamed address falls back to `module!0xoffset` (module relative)
+ * - source info is appended when the module carries debug information
+ *
+ * Results are cached because DebugSymbol.fromAddress() is expensive and the
+ * disassembly helpers call it once per instruction.
+ */
+export function formatSymbol(addr: NativePointer): string {
+    const key: string = addr.toString()
+    const cached: string | undefined = DebugSymbolCache.get(key)
+    if (cached !== undefined) return cached
+
+    let disp: string
+    try {
+        const sym: DebugSymbol = DebugSymbol.fromAddress(addr)
+        const md: Module | null = Process.findModuleByAddress(addr)
+        const modName: string = md !== null ? md.name : (sym.moduleName === null ? '?' : sym.moduleName)
+        const name: string | null = sym.name
+
+        if (name !== null && name.length > 0) {
+            let pretty: string = name
+            if (name.indexOf('_Z') === 0) {
+                try {
+                    const demangled: string = demangleName(name)
+                    if (demangled !== '') pretty = demangled
+                } catch (e) {
+                    // keep the mangled name
+                }
+            }
+            disp = `${modName}!${pretty}`
+            const delta: NativePointer | null = sym.address.isNull() ? null : addr.sub(sym.address)
+            if (delta !== null && !delta.isNull()) disp += `+0x${delta.toString(16)}`
+        } else {
+            // No symbol: fall back to a module relative offset, or the raw address
+            // when it does not belong to any module (heap / jit data pointers).
+            disp = md === null ? `${addr}` : `${modName}!0x${addr.sub(md.base).toString(16)}`
+        }
+
+        if (sym.fileName !== null && sym.fileName.length > 0) {
+            disp += `  (${sym.fileName}:${sym.lineNumber === null ? '?' : sym.lineNumber})`
+        }
+    } catch (e) {
+        disp = `${addr}`
+    }
+
+    DebugSymbolCache.set(key, disp)
+    return disp
+}
+
+/** Drop every cached symbol / address resolution, e.g. after a module got unloaded. */
+export function clearSymbolCache(): void {
+    DebugSymbolCache.clear()
+    Cache.clear()
+}
+
+declare global {
+    var formatSymbol: (addr: NativePointer | string | number) => string
+    var clearSymbolCache: () => void
+}
+
+globalThis.formatSymbol = (addr: NativePointer | string | number): string =>
+    formatSymbol(typeof addr === 'string' || typeof addr === 'number' ? ptr(addr) : addr)
+globalThis.clearSymbolCache = clearSymbolCache

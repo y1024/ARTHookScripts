@@ -36,7 +36,7 @@ const nativeFunctionOptions: NativeFunctionOptions = {
 
 function getAndroidSystemProperty(name: string) {
     if (systemPropertyGet === null) {
-        systemPropertyGet = new NativeFunction(Module.getExportByName('libc.so', '__system_property_get'), 'int', ['pointer', 'pointer'], nativeFunctionOptions)
+        systemPropertyGet = new NativeFunction(Module.findExportByName('libc.so', '__system_property_get'), 'int', ['pointer', 'pointer'], nativeFunctionOptions)
     }
     const buf = Memory.alloc(PROP_VALUE_MAX)
     systemPropertyGet(Memory.allocUtf8String(name), buf)

@@ -4,7 +4,9 @@ import { IArtMethod } from "../../../../Interface/art/mirror/IArtMethod"
 import { StandardDexFile_CodeItem } from "../dexfile/StandardDexFile"
 import { CompactDexFile_CodeItem } from "../dexfile/CompactDexFile"
 import { OatQuickMethodHeader } from "../OatQuickMethodHeader"
-import { callSym, getSym } from "../../../../Utils/SymHelper"
+import { callSym, formatSymbol, getSym } from "../../../../Utils/SymHelper"
+import { CfgAnalyzer } from "../../../../Utils/CfgAnalyzer"
+import { annotateInstruction, describeBoundary, getFunctionBoundary } from "../../../../Utils/FunctionBoundary"
 import { ArtModifiers } from "../../../../../tools/modifiers"
 import { KeyValueStore } from "../../../../../tools/common"
 import { StdString } from "../../../../../tools/StdString"
@@ -100,7 +102,9 @@ export class ArtMethod extends JSHandle implements IArtMethod, SizeOfClass {
     }
 
     get access_flags_string(): string {
-        return ArtModifiers.PrettyAccessFlags(this.access_flags)
+        const java: string = ArtModifiers.PrettyAccessFlags(this.access_flags, "method")
+        const runtime: string = ArtModifiers.PrettyRuntimeAccessFlags(this.access_flags, "method")
+        return runtime === "" ? java : `${java}[${runtime}]`
     }
 
     // uint32_t dex_code_item_offset_;
@@ -183,24 +187,8 @@ export class ArtMethod extends JSHandle implements IArtMethod, SizeOfClass {
         disp += `\n\t method_index: ${this.method_index_} | ${ptr(this.method_index)}`
         disp += `\n\t hotness_count: ${this.hotness_count_} | ${ptr(this.hotness_count)}`
         disp += `\n\t imt_index: ${this.imt_index_} | ${ptr(this.imt_index)}`
-        try {
-            let debugSymbol = DebugSymbol.fromAddress(this.data)
-            let md = Process.findModuleByAddress(this.data)
-            if (md == null || md.base == null || debugSymbol == null) throw new Error()
-            let rela =  this.data.sub(md.base)
-            disp += `\n\t data: ${this.data} -> ${rela} | ${debugSymbol.toString()}`
-        } catch (error) {
-            disp += `\n\t data: ${this.ptr_sized_fields_.data_} -> ${DebugSymbol.fromAddress(this.data).toString()}`
-        }
-        try {
-            let debugSymbol = DebugSymbol.fromAddress(this.entry_point_from_quick_compiled_code)
-            let md = Process.findModuleByAddress(this.entry_point_from_quick_compiled_code)
-            if (md == null || md.base == null || debugSymbol == null) throw new Error()
-            let rela =  this.entry_point_from_quick_compiled_code.sub(md.base)
-            disp += `\n\t jniCode: ${this.entry_point_from_quick_compiled_code} -> ${rela} | ${debugSymbol.toString()}`
-        } catch (error) {
-            disp += `\n\t jniCode: ${this.ptr_sized_fields_.entry_point_from_quick_compiled_code_}  -> ${DebugSymbol.fromAddress(this.entry_point_from_quick_compiled_code).toString()}`
-        }
+        disp += `\n\t data: ${this.data} -> ${formatSymbol(this.data)}`
+        disp += `\n\t entry_point_from_quick_compiled_code: ${this.entry_point_from_quick_compiled_code} -> ${formatSymbol(this.entry_point_from_quick_compiled_code)}`
         return disp
     }
 
@@ -497,19 +485,55 @@ export class ArtMethod extends JSHandle implements IArtMethod, SizeOfClass {
         }
     }
 
-    showAsm(num: number = 10, info: boolean = false,) {
+    /**
+     * Disassemble the native implementation (ArtMethod::data_).
+     * `num = -1` (default) prints the whole function, the boundary is resolved by
+     * getFunctionBoundary(): ELF st_size first, lightweight CFG as a fallback.
+     */
+    showAsm(num: number = -1, info: boolean = false) {
         newLine()
         if (info) LOGD(`👉 ${this}\n`)
         LOGD(this.methodName)
-        const debugSymbol = DebugSymbol.fromAddress(this.data)
-        LOGZ(`[ ${debugSymbol} ]`)
+        LOGZ(`[ ${formatSymbol(this.data)} ]`)
         newLine()
-        LOGW(`Showing ASM with num: ${num}\n`)
-        let md = Process.findModuleByAddress(this.data)
-        let insns = Instruction.parse(this.data)
-        for (let i = 0; i < num; i++) {
-            LOGD(`${insns.address} | ${insns.address.sub(md.base)}  ${insns.toString()}`)
-            insns = Instruction.parse(insns.next)
+
+        const boundary = getFunctionBoundary(this.data)
+        LOGZ(`[ ${describeBoundary(boundary)} ]`)
+        if (boundary.confidence === 'low') LOGW(`[ boundary confidence is LOW, the result may over/under extend ]`)
+        newLine()
+
+        const wholeFunction: boolean = num === -1 && boundary.size > 0
+        const maxCount: number = wholeFunction
+            ? Math.ceil(boundary.size / CfgAnalyzer.granularity()) + 4
+            : (num === -1 ? 20 : num)
+        LOGW(`Showing ASM with ${wholeFunction ? `function boundary (${boundary.size} bytes)` : `num: ${maxCount}`}\n`)
+
+        const md = Process.findModuleByAddress(this.data)
+        let insns: Instruction
+        try {
+            insns = Instruction.parse(this.data) as Instruction
+        } catch (error) {
+            LOGE(`Cannot decode an instruction at ${this.data}`)
+            newLine()
+            return
+        }
+
+        let index: number = 0
+        let offset: number = 0
+        while (index < maxCount) {
+            if (wholeFunction && insns.address.compare(boundary.end) >= 0) break
+            index++
+            const indexStr: string = `[${index.toString().padStart(5, ' ')}|${ptr(offset).toString().padEnd(7, ' ')}]`
+            const rel = md === null ? '?' : insns.address.sub(md.base)
+            const annotation: string = annotateInstruction(insns, boundary.start, boundary.end)
+            LOGD(`${indexStr} ${insns.address} | ${rel}  ${insns.toString()}${annotation}`)
+            offset += insns.size
+            try {
+                insns = Instruction.parse(insns.next) as Instruction
+            } catch (error) {
+                LOGE(`${indexStr} ${insns.next} <--- UNDECODABLE, stop`)
+                break
+            }
         }
         newLine()
     }
@@ -560,47 +584,61 @@ export class ArtMethod extends JSHandle implements IArtMethod, SizeOfClass {
         newLine()
     }
 
+    /**
+     * Disassemble the AOT/JIT compiled code of this method.
+     * The end of the function comes from art::OatQuickMethodHeader::code_size_, which
+     * sits 8 bytes before the code and is written by the compiler, so it is exact.
+     * Falls back to the ELF symbol table and then to the lightweight CFG.
+     */
     showOatAsm(num: number = -1, info: boolean = false) {
         newLine()
         if (info) LOGD(`👉 ${this}\n`)
         LOGD(this.methodName)
-        const debugSymbol = DebugSymbol.fromAddress(this.data)
-        LOGZ(`[ ${debugSymbol} ]`)
+        LOGZ(`[ ${formatSymbol(this.data)} ]`)
         newLine()
 
-        // 暂时无法去确定asm的结束位置
-        let insns: Instruction = Instruction.parse(this.data)
+        const boundary = getFunctionBoundary(this.data, { oatHeader: true })
+        LOGZ(`[ ${describeBoundary(boundary)} ]`)
+        if (boundary.confidence === 'low') LOGW(`[ boundary confidence is LOW, the result may over/under extend ]`)
+        newLine()
+
+        const wholeFunction: boolean = num === -1 && boundary.size > 0
+        const maxCount: number = wholeFunction
+            ? Math.ceil(boundary.size / CfgAnalyzer.granularity()) + 4
+            : (num === -1 ? 20 : num)
+
+        let insns: Instruction
+        try {
+            insns = Instruction.parse(this.data) as Instruction
+        } catch (error) {
+            LOGE(`Cannot decode an instruction at ${this.data}`)
+            newLine()
+            return
+        }
+
         let num_local: number = 0
         let code_offset: number = 0
-        let errorFlag: boolean = false
-        while (++num_local < (num == -1 ? 20 : getSymSize(debugSymbol))) {
-            let indexStr: string = `[${num_local.toString().padStart(4, ' ')}|${ptr(code_offset).toString().padEnd(5, ' ')}]`
-            !errorFlag ? LOGD(`${indexStr} ${insns.address}\t${insns.toString()}`) : function () {
-                const bt: ArrayBuffer = insns.address.readByteArray(4)
-                const btStr: string = Array.from(new Uint8Array(bt)).map((item: number) => item.toString(16).padStart(2, '0')).join(' ')
-                LOGE(`${indexStr} ${insns.address}\t${btStr} <--- ERROR`)
-            }()
+        while (num_local < maxCount) {
+            if (wholeFunction && insns.address.compare(boundary.end) >= 0) break
+            num_local++
+            const indexStr: string = `[${num_local.toString().padStart(4, ' ')}|${ptr(code_offset).toString().padEnd(5, ' ')}]`
+            const annotation: string = annotateInstruction(insns, boundary.start, boundary.end)
+            LOGD(`${indexStr} ${insns.address}\t${insns.toString()}${annotation}`)
             code_offset += insns.size
             try {
-                insns = Instruction.parse(insns.next)
-                errorFlag = false
+                insns = Instruction.parse(insns.next) as Instruction
             } catch (error) {
-                insns = Instruction.parse(insns.address.add(PointerSize))
-                errorFlag = true
+                const raw: ArrayBuffer | null = insns.next.readByteArray(4)
+                const rawStr: string = raw === null ? '??' :
+                    Array.from(new Uint8Array(raw)).map((item: number) => item.toString(16).padStart(2, '0')).join(' ')
+                LOGE(`${indexStr} ${insns.next}\t${rawStr} <--- UNDECODABLE, stop`)
+                break
             }
-            // todo 这里的num后续可以省略，使用栈寄存器判断平栈的位置作为函数结束的位置
-            // 还需要去了解一下oat文件格式，配合一些其他的信息来添加上更多的一些符号信息以便于提高可读性
-            // 解析出更多信息后是不是可以考虑在进入这个函数的时候判断当前函数是否已经被oat然后决定实现javahook的方式直接去hook已经编译好的oat文件
         }
         newLine()
 
-        function getSymSize(debugSymbol:DebugSymbol){
-            return 20
-            if (debugSymbol.name != null) {
-                // todo
-                // 使用 CMoudle 来解析 elf dynamic段，遍历符号并取得符号长度并返回
-            }
-        }
+        // todo 配合 oat 文件格式解析出更多符号信息以提高可读性
+        // todo 进入函数时判断当前方法是否已经被 oat 编译，据此决定是否直接 hook 已编译好的 oat 代码
     }
 
     public forEachSmali = (callback: (instruction: ArtInstruction, codeitem: DexItemStruct) => void): void => forEachSmali_static.bind(this)(this, callback)

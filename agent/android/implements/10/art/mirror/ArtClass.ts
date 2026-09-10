@@ -131,7 +131,9 @@ export class ArtClass extends ArtObject implements SizeOfClass {
     }
 
     get access_flags_string(): string {
-        return PrettyAccessFlags(this.access_flags)
+        const java: string = PrettyAccessFlags(this.access_flags, "class")
+        const runtime: string = PrettyRuntimeAccessFlags(this.access_flags, "class")
+        return runtime === "" ? java : `${java}[${runtime}]`
     }
 
     get class_flags(): number {

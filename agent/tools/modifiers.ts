@@ -42,7 +42,69 @@ export class ArtModifiers {
 
     // ...
 
-    public static PrettyAccessFlags = (access_flags: NativePointer | number): string => {
+    // Runtime only ART access flags (Android 10), everything above kAccJavaFlagsMask.
+    // Several bits are overloaded: the meaning depends on the member kind and on
+    // whether the method is native. Values mirror frida-java-bridge/lib/android.js.
+    static kAccMiranda = 0x00200000;                       // method (runtime, not native)
+    static kAccDefault = 0x00400000;                       // method (runtime)
+    static kAccDefaultConflicting = 0x00800000;            // method (runtime)
+    static kAccCompileDontBother = 0x02000000;             // method (runtime)
+    static kAccIntrinsic = 0x04000000;                     // method (runtime)
+    static kAccRuntimeOnly = 0x04000000;                   // field (runtime)
+    static kAccSingleImplementation = 0x08000000;          // method (runtime)
+    static kAccPublicApi = 0x10000000;                     // field, method (runtime)
+    static kAccCorePlatformApi = 0x20000000;               // field, method (runtime)
+    static kAccFastInterpreterToInterpreterInvoke = 0x40000000;  // method (runtime)
+    static kAccPreviouslyWarm = 0x80000000;                // method (runtime)
+    static kAccCriticalNative = 0x00200000;                // method (runtime, native only)
+    static kAccFastNative = 0x00080000;                    // method (runtime, native only)
+
+    /**
+     * Decode the runtime only access flags, i.e. everything the JVM level
+     * PrettyAccessFlags() does not cover. Returns `A|B|C`, or '' when there is none.
+     */
+    public static PrettyRuntimeAccessFlags = (access_flags: NativePointer | number, kind: AccessFlagKind = "method"): string => {
+        const flags: number = typeof access_flags === "number" ? access_flags : access_flags.toUInt32()
+        const runtime: number = (flags & ~ArtModifiers.kAccJavaFlagsMask) >>> 0
+        if (runtime === 0) return ""
+
+        const isNative: boolean = (flags & ArtModifiers.kAccNative) !== 0
+        const names: string[] = []
+        const add = (bit: number, name: string): void => { if ((runtime & bit) >>> 0 !== 0) names.push(name) }
+
+        if (kind === "method") {
+            add(ArtModifiers.kAccConstructor, "Constructor")
+            add(ArtModifiers.kAccDeclaredSynchronized, "DeclaredSynchronized")
+            add(ArtModifiers.kAccObsoleteMethod, "ObsoleteMethod")
+            add(ArtModifiers.kAccCopied, "Copied")
+            // 0x00080000 and 0x00200000 mean different things for native methods
+            if ((runtime & ArtModifiers.kAccFastNative) !== 0) names.push(isNative ? "FastNative" : "SkipAccessChecks")
+            if ((runtime & ArtModifiers.kAccCriticalNative) !== 0) names.push(isNative ? "CriticalNative" : "Miranda")
+            add(ArtModifiers.kAccDefault, "Default")
+            add(ArtModifiers.kAccDefaultConflicting, "DefaultConflicting")
+            add(ArtModifiers.kAccCompileDontBother, "CompileDontBother")
+            add(ArtModifiers.kAccIntrinsic, "Intrinsic")
+            add(ArtModifiers.kAccSingleImplementation, "SingleImplementation")
+            add(ArtModifiers.kAccPublicApi, "PublicApi")
+            add(ArtModifiers.kAccCorePlatformApi, "CorePlatformApi")
+            add(ArtModifiers.kAccFastInterpreterToInterpreterInvoke, "FastInterpToInterpInvoke")
+            add(ArtModifiers.kAccPreviouslyWarm, "PreviouslyWarm")
+        } else if (kind === "class") {
+            add(ArtModifiers.kAccClassIsProxy, "ClassIsProxy")
+            add(ArtModifiers.kAccVerificationAttempted, "VerificationAttempted")
+            add(ArtModifiers.kAccSkipHiddenapiChecks, "SkipHiddenapiChecks")
+        } else {
+            add(ArtModifiers.kAccRuntimeOnly, "RuntimeOnly")
+            add(ArtModifiers.kAccPublicApi, "PublicApi")
+            add(ArtModifiers.kAccCorePlatformApi, "CorePlatformApi")
+        }
+
+        return names.join("|")
+    }
+
+    // kAccVolatile/kAccBridge share 0x0040 and kAccTransient/kAccVarargs share 0x0080,
+    // kAccSynchronized/kAccSuper share 0x0020, so the member kind is required to print the right name.
+    public static PrettyAccessFlags = (access_flags: NativePointer | number, kind: AccessFlagKind = "method"): string => {
         let access_flags_local: NativePointer = NULL
         if (typeof access_flags === "number") {
             access_flags_local = ptr(access_flags)
@@ -50,45 +112,69 @@ export class ArtModifiers {
             access_flags_local = access_flags
         }
         if (access_flags_local.isNull()) throw new Error("access_flags is null")
+        const has = (flag: number): boolean => !(access_flags_local.and(flag)).isNull()
         let result: string = ""
-        if (!(access_flags_local.and(ArtModifiers.kAccPublic)).isNull()) {
+        if (has(ArtModifiers.kAccPublic)) {
             result += "public "
         }
-        if (!(access_flags_local.and(ArtModifiers.kAccProtected)).isNull()) {
+        if (has(ArtModifiers.kAccProtected)) {
             result += "protected "
         }
-        if (!(access_flags_local.and(ArtModifiers.kAccPrivate)).isNull()) {
+        if (has(ArtModifiers.kAccPrivate)) {
             result += "private "
         }
-        if (!(access_flags_local.and(ArtModifiers.kAccFinal)).isNull()) {
-            result += "final "
-        }
-        if (!(access_flags_local.and(ArtModifiers.kAccStatic)).isNull()) {
-            result += "static "
-        }
-        if (!(access_flags_local.and(ArtModifiers.kAccAbstract)).isNull()) {
+        if (has(ArtModifiers.kAccAbstract)) {
             result += "abstract "
         }
-        if (!(access_flags_local.and(ArtModifiers.kAccInterface)).isNull()) {
+        if (has(ArtModifiers.kAccStatic)) {
+            result += "static "
+        }
+        if (has(ArtModifiers.kAccFinal)) {
+            result += "final "
+        }
+        if (has(ArtModifiers.kAccTransient)) {
+            result += kind === "field" ? "transient " : (kind === "method" ? "varargs " : "")
+        }
+        if (has(ArtModifiers.kAccVolatile)) {
+            result += kind === "field" ? "volatile " : (kind === "method" ? "bridge " : "")
+        }
+        if (kind === "method" && has(ArtModifiers.kAccSynchronized)) {
+            result += "synchronized "
+        }
+        if (has(ArtModifiers.kAccNative)) {
+            result += "native "
+        }
+        if (has(ArtModifiers.kAccStrict)) {
+            result += "strictfp "
+        }
+        if (has(ArtModifiers.kAccSynthetic)) {
+            result += "synthetic "
+        }
+        if (has(ArtModifiers.kAccAnnotation)) {
+            result += "annotation "
+        }
+        if (has(ArtModifiers.kAccEnum)) {
+            result += "enum "
+        }
+        if (has(ArtModifiers.kAccInterface)) {
             result += "interface "
         }
-        if (!(access_flags_local.and(ArtModifiers.kAccTransient)).isNull()) {
-            result += "transient "
-        }
-        if (!(access_flags_local.and(ArtModifiers.kAccVolatile)).isNull()) {
-            result += "volatile "
-        }
-        if (!(access_flags_local.and(ArtModifiers.kAccSynchronized)).isNull()) {
-            result += "synchronized "
+        if (kind === "method" && has(ArtModifiers.kAccConstructor)) {
+            result += "constructor "
         }
         return result
     }
 }
 
+// Member kind used to disambiguate access flags that share the same bit.
+export type AccessFlagKind = "class" | "field" | "method"
+
 declare global {
-    var PrettyAccessFlags: (access_flags: NativePointer | number) => string
+    var PrettyAccessFlags: (access_flags: NativePointer | number, kind?: AccessFlagKind) => string
+    var PrettyRuntimeAccessFlags: (access_flags: NativePointer | number, kind?: AccessFlagKind) => string
 }
 
-globalThis.PrettyAccessFlags = (access_flags: NativePointer | number) => ArtModifiers.PrettyAccessFlags(access_flags)
+globalThis.PrettyAccessFlags = (access_flags: NativePointer | number, kind: AccessFlagKind = "method") => ArtModifiers.PrettyAccessFlags(access_flags, kind)
+globalThis.PrettyRuntimeAccessFlags = (access_flags: NativePointer | number, kind: AccessFlagKind = "method") => ArtModifiers.PrettyRuntimeAccessFlags(access_flags, kind)
 
 Reflect.set(globalThis, "ArtModifiers", ArtModifiers)

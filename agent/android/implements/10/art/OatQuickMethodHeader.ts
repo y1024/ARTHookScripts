@@ -48,7 +48,9 @@ export class OatQuickMethodHeader extends JSHandle {
     }
 
     get code(): NativePointer {
-        return this.code_.readPointer()
+        // uint8_t code_[0] is a flexible array member, so the code starts right after
+        // the 8 byte header. It must NOT be dereferenced.
+        return this.code_
     }
 
     // const uint8_t* GetOptimizedCodeInfoPtr()

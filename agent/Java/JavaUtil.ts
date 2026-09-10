@@ -1,4 +1,5 @@
 import { ArtMethod } from "../android/implements/10/art/mirror/ArtMethod"
+import { ArtModifiers } from "../tools/modifiers"
 
 // 记录一下当前遍历出来的class便于直接使用index选择
 const arrayCurrentClassItems: string[] = []
@@ -7,6 +8,116 @@ interface JavaMembers {
     methods: Java.Method[]
     fields: Java.Field[]
     fields_name: string[]
+}
+
+/** `I` -> `int`, `Ljava/lang/String;` -> `java.lang.String`, `[I` -> `int[]` */
+export function prettyTypeDescriptor(desc: string): string {
+    if (desc === null || desc === undefined || desc.length === 0) return '?'
+    let dims: number = 0
+    let i: number = 0
+    while (i < desc.length && desc.charAt(i) === '[') { dims++; i++ }
+    const body: string = desc.slice(i)
+    let base: string
+    switch (body.charAt(0)) {
+        case 'V': base = 'void'; break
+        case 'Z': base = 'boolean'; break
+        case 'B': base = 'byte'; break
+        case 'S': base = 'short'; break
+        case 'C': base = 'char'; break
+        case 'I': base = 'int'; break
+        case 'J': base = 'long'; break
+        case 'F': base = 'float'; break
+        case 'D': base = 'double'; break
+        case 'L':
+            base = (body.endsWith(';') ? body.slice(1, body.length - 1) : body.slice(1)).replace(/\//g, '.')
+            break
+        default: base = body
+    }
+    let suffix: string = ''
+    for (let d = 0; d < dims; d++) suffix += '[]'
+    return base + suffix
+}
+
+/** Accept both the raw descriptor string and frida-java-bridge's type object. */
+function prettyFieldType(rt: any): string {
+    if (rt === null || rt === undefined) return '?'
+    if (typeof rt === 'string') return prettyTypeDescriptor(rt)
+    if (typeof rt === 'object') {
+        if (typeof rt.className === 'string' && rt.className.length > 0) return rt.className
+        if (typeof rt.name === 'string' && rt.name.length > 0) return prettyTypeDescriptor(rt.name)
+    }
+    return `${rt}`
+}
+
+/** Never dump a Java wrapper through JSON.stringify, that leaks the internal `_p` array. */
+function prettyFieldValue(value: any): string {
+    if (value === null || value === undefined) return 'null'
+    const t: string = typeof value
+    if (t === 'string') return `"${value}"`
+    if (t === 'number' || t === 'boolean') return `${value}`
+    try {
+        const s: string = `${value}`
+        if (s !== '[object Object]') return s
+    } catch (e) {
+        // fall through
+    }
+    try {
+        return JSON.stringify(value)
+    } catch (e) {
+        return `${value}`
+    }
+}
+
+/**
+ * Render one field as `<flags> <type> <name> = <value>` for statics and
+ * `<flags> <type> <name>` for instance fields, followed by the object layout
+ * offset and the ArtField pointer so it can be fed to the native helpers.
+ */
+export function describeJavaField(field: Java.Field, name: string): string {
+    // frida-java-bridge Java.Field internals:
+    // _p[0] holder | _p[1] fieldType (1 = static) | _p[2] fieldReturnType
+    // _p[3] ArtField pointer | _p[4] getValue | _p[5] setValue
+    const p: any = (field as any)._p
+    let isStatic: boolean = false
+    let artField: NativePointer | null = null
+    let typeName: string = '?'
+
+    if (Array.isArray(p)) {
+        isStatic = p[1] === 1
+        try { artField = ptr(p[3]) } catch (e) { artField = null }
+        typeName = prettyFieldType(p[2])
+    }
+    if (typeName === '?') {
+        try { typeName = prettyFieldType((field as any).fieldReturnType) } catch (e) { /* keep '?' */ }
+    }
+
+    let flags: string = ''
+    let offsetInfo: string = ''
+    if (artField !== null) {
+        try {
+            const spec = getArtFieldSpec(artField)
+            flags = PrettyAccessFlags(spec.accessFlags, "field")
+            const runtime: string = ArtModifiers.PrettyRuntimeAccessFlags(spec.accessFlags, "field")
+            if (runtime !== '') flags += `[${runtime}]`
+            if (flags.length > 0) flags += ' '
+            offsetInfo = `${isStatic ? 'statics offset' : 'field offset'} 0x${spec.offset.toString(16)}`
+        } catch (e) {
+            // ArtField layout mismatch, still print what we have
+        }
+    }
+
+    let disp: string = `${flags}${typeName} ${name}`
+    if (isStatic) {
+        let value: string
+        try { value = prettyFieldValue(field.value) } catch (e) { value = '<unreadable>' }
+        disp += ` = ${value}`
+    }
+
+    const meta: string[] = []
+    if (offsetInfo !== '') meta.push(offsetInfo)
+    if (artField !== null) meta.push(`ArtField ${artField}`)
+    if (meta.length > 0) disp += `   // ${meta.join(' | ')}`
+    return disp
 }
 
 var loaders = []
@@ -121,18 +232,10 @@ globalThis.listJavaMethods = (className: string | number = "com.unity3d.player.U
 
     try {
         LOGD(`\n[*] Fields :`)
-        members.fields.map((field: Java.Field, index: number) => {
-            let flag: string = ""
-            let currentIndex = ++countFields
-            // flag += PrettyJavaAccessFlags(getArtFieldSpec(field["_p"][3]).accessFlags)
-            try {
-                // static fields 
-                return `\n\t[${currentIndex}] ${flag}${members.fields_name[index]} : ${JSON.stringify(field.value)} | ${field.fieldReturnType}`
-            } catch (error) {
-                // instance fields
-                return `\n\t[${currentIndex}] ${flag}${members.fields_name[index]} : ${JSON.stringify(field)}`
-            }
-        }).forEach(LOGD)
+        members.fields.forEach((field: Java.Field, index: number) => {
+            const currentIndex = ++countFields
+            LOGD(`\n\t[${currentIndex}] ${describeJavaField(field, members.fields_name[index])}`)
+        })
         newLine()
     } catch (e) {
         LOGE(e)
@@ -291,4 +394,11 @@ declare global {
     var filterJavaMethods: (methodNameFilter: string, className: string | number | undefined) => void
     var listFieldsInstance: (className: string | number) => void
     var lfs : (className: string | number) => void // alias of listFieldsInstance
+    /** `I` -> `int`, `Ljava/lang/String;` -> `java.lang.String`, `[I` -> `int[]` */
+    var prettyTypeDescriptor: (desc: string) => string
+    /** One line `<flags> <type> <name> = <value> // offset | ArtField` rendering. */
+    var describeJavaField: (field: Java.Field, name: string) => string
 }
+
+globalThis.prettyTypeDescriptor = prettyTypeDescriptor
+globalThis.describeJavaField = describeJavaField
